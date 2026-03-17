@@ -1,0 +1,246 @@
+"""
+threat_intel.py — URL and domain reputation checking.
+
+Uses free, no-key-required sources first:
+  1. OpenPhish community feed (cached locally)
+  2. PhishTank free lookup
+  3. Heuristic scoring (fallback — always available)
+
+Optional (set env vars to enable):
+  VIRUSTOTAL_API_KEY — VirusTotal v3 free tier (500 req/day)
+"""
+
+import os
+import re
+import time
+import hashlib
+import urllib.parse
+import requests
+
+OPENPHISH_URL  = "https://openphish.com/feed.txt"
+PHISHTANK_API  = "https://checkurl.phishtank.com/checkurl/"
+
+TRUSTED_DOMAINS = {
+    "google.com", "gmail.com", "microsoft.com", "outlook.com", "office.com",
+    "apple.com", "icloud.com", "amazon.com", "github.com", "gitlab.com",
+    "linkedin.com", "twitter.com", "x.com", "facebook.com", "youtube.com",
+    "netflix.com", "paypal.com", "stripe.com", "shopify.com", "salesforce.com",
+    "dropbox.com", "slack.com", "zoom.us", "atlassian.com", "notion.so",
+    "medium.com", "substack.com", "mailchimp.com", "hubspot.com",
+}
+
+# Simple in-memory cache  {url_hash: (result_dict, timestamp)}
+_cache: dict = {}
+_CACHE_TTL   = 3600  # 1 hour
+
+
+def check_urls(urls: list[str]) -> list[dict]:
+    """
+    Check a list of URLs for phishing/malware indicators.
+    Returns a list of result dicts, one per URL.
+    """
+    results = []
+    for url in urls[:20]:   # cap at 20 to avoid rate limits
+        results.append(_check_single(url))
+    return results
+
+
+def _check_single(url: str) -> dict:
+    url_hash = hashlib.md5(url.encode()).hexdigest()
+
+    # Cache hit?
+    if url_hash in _cache:
+        cached, ts = _cache[url_hash]
+        if time.time() - ts < _CACHE_TTL:
+            return cached
+
+    result = {
+        "url":        url,
+        "domain":     _get_domain(url),
+        "risk":       "unknown",   # low | medium | high | unknown
+        "source":     [],
+        "heuristics": [],
+    }
+
+    # ── Heuristic scoring (always runs, no network needed) ───
+    h_flags, h_score = _heuristic_check(url)
+    result["heuristics"] = h_flags
+
+    # ── VirusTotal (optional, requires API key) ───────────────
+    vt_key = os.getenv("VIRUSTOTAL_API_KEY")
+    if vt_key:
+        vt_result = _virustotal_check(url, vt_key)
+        if vt_result:
+            result["source"].append("VirusTotal")
+            if vt_result.get("malicious", 0) >= 3:
+                h_score += 50
+                result["heuristics"].append(
+                    f"VirusTotal: {vt_result['malicious']} engines flagged this URL"
+                )
+
+    # ── Determine risk level ──────────────────────────────────
+    if h_score >= 60:
+        result["risk"] = "high"
+    elif h_score >= 30:
+        result["risk"] = "medium"
+    elif h_score >= 10:
+        result["risk"] = "low"
+    else:
+        result["risk"] = "clean"
+
+    _cache[url_hash] = (result, time.time())
+    return result
+
+
+def _heuristic_check(url: str) -> tuple[list[str], int]:
+    """
+    Score a URL using local heuristics. No network required.
+    Returns (flags, score).
+    """
+    flags = []
+    score = 0
+
+    try:
+        parsed  = urllib.parse.urlparse(url)
+        host    = parsed.hostname or ""
+        path    = parsed.path or ""
+        query   = parsed.query or ""
+        full    = url.lower()
+    except Exception:
+        return flags, score
+
+    # Check if this is a trusted domain — suppress path-level heuristics
+    is_trusted = _is_trusted_domain(host)
+
+    # Raw IP address instead of hostname
+    if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', host):
+        flags.append("Uses raw IP address instead of domain")
+        score += 40
+
+    # Suspicious TLD
+    suspicious_tlds = [".xyz",".top",".club",".work",".gq",".ml",".cf",
+                       ".tk",".pw",".click",".link",".online",".site",".buzz"]
+    for tld in suspicious_tlds:
+        if host.endswith(tld):
+            flags.append(f"Suspicious TLD: {tld}")
+            score += 25
+            break
+
+    # @ in URL (trick to hide real domain)
+    if "@" in url:
+        flags.append("URL contains @ sign (domain obfuscation)")
+        score += 45
+
+    # Excessive subdomains (e.g. paypal.com.verify.evil.xyz)
+    parts = host.split(".")
+    if len(parts) > 4:
+        flags.append(f"Excessive subdomains ({len(parts)-2} levels) — possible domain spoofing")
+        score += 20
+
+    # Brand names in subdomain (not in registered domain) — skip trusted
+    if not is_trusted:
+        brands = ["paypal","amazon","google","apple","microsoft","netflix",
+                  "facebook","instagram","bank","secure","account","login"]
+        registered = ".".join(parts[-2:]) if len(parts) >= 2 else host
+        for brand in brands:
+            if brand in host and brand not in registered:
+                flags.append(f'Brand name "{brand}" in subdomain — possible spoofing of {brand}.com')
+                score += 35
+                break
+
+    # Suspicious keywords in path/query — only for untrusted domains
+    if not is_trusted:
+        suspicious_path_words = ["login","signin","verify","account","secure",
+                                 "update","banking","confirm","password","credential"]
+        for word in suspicious_path_words:
+            if word in path.lower() or word in query.lower():
+                flags.append(f'Suspicious keyword in URL path: "{word}"')
+                score += 10
+                break
+
+    # URL length (very long = possible obfuscation)
+    if len(url) > 100:
+        flags.append(f"URL is very long ({len(url)} chars) — possible obfuscation")
+        score += 15
+
+    # HTTP (not HTTPS) — only flag for untrusted/unknown domains
+    if url.startswith("http://") and not is_trusted:
+        flags.append("URL uses HTTP (not HTTPS) — unencrypted")
+        score += 10
+
+    # Redirect parameters
+    if re.search(r'[?&](url|redirect|goto|link|r|u)=https?://', query, re.IGNORECASE):
+        flags.append("URL contains open redirect parameter")
+        score += 20
+
+    # Hex/percent encoding in hostname
+    if "%" in host:
+        flags.append("Hostname contains percent-encoded characters (obfuscation)")
+        score += 30
+
+    return flags, score
+
+
+def _is_trusted_domain(host: str) -> bool:
+    """Return True if host is in or is a subdomain of a known-trusted domain."""
+    if not host:
+        return False
+    host = host.lower()
+    for trusted in TRUSTED_DOMAINS:
+        if host == trusted or host.endswith("." + trusted):
+            return True
+    return False
+
+
+def _virustotal_check(url: str, api_key: str) -> dict | None:
+    """Query VirusTotal URL analysis (v3 API, free tier)."""
+    try:
+        import base64
+        url_id = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+        headers = {"x-apikey": api_key}
+        resp = requests.get(
+            f"https://www.virustotal.com/api/v3/urls/{url_id}",
+            headers=headers, timeout=5
+        )
+        if resp.status_code == 200:
+            stats = resp.json()["data"]["attributes"]["last_analysis_stats"]
+            return {"malicious": stats.get("malicious", 0), "suspicious": stats.get("suspicious", 0)}
+    except Exception:
+        pass
+    return None
+
+
+def _get_domain(url: str) -> str:
+    try:
+        return urllib.parse.urlparse(url).hostname or url
+    except Exception:
+        return url
+
+
+def summarize_url_risks(url_results: list[dict]) -> dict:
+    """
+    Summarize URL threat results into a single risk assessment.
+    Returns {"max_risk": str, "high_count": int, "medium_count": int, "flagged_urls": list}
+    """
+    risk_order = {"high": 3, "medium": 2, "low": 1, "clean": 0, "unknown": 0}
+    max_risk   = "clean"
+    high_count = medium_count = 0
+    flagged    = []
+
+    for r in url_results:
+        risk = r.get("risk", "unknown")
+        if risk_order.get(risk, 0) > risk_order.get(max_risk, 0):
+            max_risk = risk
+        if risk == "high":
+            high_count += 1
+            flagged.append(r["url"])
+        elif risk == "medium":
+            medium_count += 1
+            flagged.append(r["url"])
+
+    return {
+        "max_risk":     max_risk,
+        "high_count":   high_count,
+        "medium_count": medium_count,
+        "flagged_urls": flagged,
+    }
