@@ -19,6 +19,7 @@ import requests
 
 OPENPHISH_URL  = "https://openphish.com/feed.txt"
 PHISHTANK_API  = "https://checkurl.phishtank.com/checkurl/"
+ABUSEIPDB_API  = "https://api.abuseipdb.com/api/v2/check"
 
 TRUSTED_DOMAINS = {
     "google.com", "gmail.com", "microsoft.com", "outlook.com", "office.com",
@@ -43,6 +44,116 @@ def check_urls(urls: list[str]) -> list[dict]:
     for url in urls[:20]:   # cap at 20 to avoid rate limits
         results.append(_check_single(url))
     return results
+
+
+def check_ips(ip_data: list[dict]) -> list[dict]:
+    """
+    Check IP addresses for abuse/attack history using AbuseIPDB.
+    
+    Args:
+        ip_data: list of dicts with 'ip', 'source', 'context' keys
+    
+    Returns:
+        list of dicts with IP reputation data
+    """
+    results = []
+    abuseipdb_key = os.getenv("ABUSEIPDB_API_KEY")
+    
+    for ip_info in ip_data[:10]:  # cap at 10 to avoid rate limits
+        ip = ip_info["ip"]
+        result = {
+            "ip": ip,
+            "source": ip_info.get("source", "Unknown"),
+            "context": ip_info.get("context", ""),
+            "risk": "unknown",
+            "abuse_score": 0,
+            "reports": 0,
+            "last_reported": None,
+            "country": None,
+            "isp": None,
+            "is_public": True,
+            "is_whitelisted": False,
+            "flags": [],
+        }
+        
+        # ── Check with AbuseIPDB if API key is available ──────
+        if abuseipdb_key:
+            abuse_data = _check_abuseipdb(ip, abuseipdb_key)
+            if abuse_data:
+                result["abuse_score"] = abuse_data.get("abuseConfidenceScore", 0)
+                result["reports"] = abuse_data.get("totalReports", 0)
+                result["last_reported"] = abuse_data.get("lastReportedAt")
+                result["country"] = abuse_data.get("countryCode")
+                result["isp"] = abuse_data.get("isp")
+                result["is_public"] = abuse_data.get("isPublic", True)
+                result["is_whitelisted"] = abuse_data.get("isWhitelisted", False)
+                
+                # Add flags based on abuse score
+                score = result["abuse_score"]
+                if score >= 75:
+                    result["risk"] = "high"
+                    result["flags"].append(f"High abuse score: {score}% confidence")
+                    if result["reports"] > 0:
+                        result["flags"].append(f"Reported {result['reports']} times for abuse")
+                elif score >= 25:
+                    result["risk"] = "medium"
+                    result["flags"].append(f"Moderate abuse score: {score}%")
+                    if result["reports"] > 0:
+                        result["flags"].append(f"Has {result['reports']} abuse reports")
+                elif score > 0:
+                    result["risk"] = "low"
+                    result["flags"].append(f"Low abuse score: {score}%")
+                else:
+                    result["risk"] = "clean"
+                
+                if result["is_whitelisted"]:
+                    result["risk"] = "clean"
+                    result["flags"].append("Whitelisted IP (legitimate service)")
+        else:
+            # Fallback: basic heuristic without API
+            result["flags"].append("No AbuseIPDB API key - limited analysis")
+            result["risk"] = "unknown"
+        
+        results.append(result)
+    
+    return results
+
+
+def _check_abuseipdb(ip: str, api_key: str, max_age_days: int = 90) -> dict | None:
+    """
+    Query AbuseIPDB API for IP reputation.
+    Free tier: 1000 requests/day
+    
+    Returns dict with abuse data or None on error.
+    """
+    try:
+        headers = {
+            "Key": api_key,
+            "Accept": "application/json"
+        }
+        params = {
+            "ipAddress": ip,
+            "maxAgeInDays": max_age_days,
+            "verbose": ""
+        }
+        
+        resp = requests.get(
+            ABUSEIPDB_API,
+            headers=headers,
+            params=params,
+            timeout=5
+        )
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("data", {})
+        elif resp.status_code == 429:
+            # Rate limit exceeded
+            return {"error": "rate_limit", "abuseConfidenceScore": 0}
+        else:
+            return None
+    except Exception as e:
+        return None
 
 
 def _check_single(url: str) -> dict:

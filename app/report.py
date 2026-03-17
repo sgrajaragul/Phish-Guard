@@ -14,6 +14,11 @@ RISK_WEIGHTS = {
     "url_high_risk":   20,
     "url_medium_risk":  8,
 
+    # IP threat intelligence — independent signal
+    "ip_high_risk":    25,
+    "ip_medium_risk":  12,
+    "ip_low_risk":      5,
+
     # Feature bonuses — only meaningful alongside ML suspicion
     # These are multiplied by ml_phishing_prob so they don't inflate legit scores
     "has_script":           18,
@@ -35,6 +40,7 @@ def build_report(
     feat_result: dict,
     ml_result:   dict,
     url_results: list[dict],
+    ip_results:  list[dict] = None,
 ) -> dict:
     """
     Build a comprehensive phishing analysis report.
@@ -44,14 +50,19 @@ def build_report(
         feat_result: Output from features.extract_features()
         ml_result:   Output from model.predict()
         url_results: Output from threat_intel.check_urls()
+        ip_results:  Output from threat_intel.check_ips()
 
     Returns:
         Full report dict ready for JSON serialization / template rendering.
     """
+    if ip_results is None:
+        ip_results = []
+        
     features   = feat_result["features"]
     flags      = feat_result["flags"]
     url_list   = feat_result.get("url_list", [])
     url_summary = summarize_url_risks(url_results)
+    ip_summary  = summarize_ip_risks(ip_results)
 
     # ── Risk score calculation (0–100) ────────────────────────
     score = 0
@@ -63,6 +74,11 @@ def build_report(
     # URL threat intel — independent of ML, always full weight
     score += url_summary["high_count"]   * RISK_WEIGHTS["url_high_risk"]
     score += url_summary["medium_count"] * RISK_WEIGHTS["url_medium_risk"]
+
+    # IP threat intel — independent of ML, always full weight
+    score += ip_summary["high_count"]   * RISK_WEIGHTS["ip_high_risk"]
+    score += ip_summary["medium_count"] * RISK_WEIGHTS["ip_medium_risk"]
+    score += ip_summary["low_count"]    * RISK_WEIGHTS["ip_low_risk"]
 
     # Feature flag bonuses — scaled by ML confidence
     # When ML says <45% phishing, bonuses are heavily dampened (×0.3)
@@ -110,11 +126,32 @@ def build_report(
             "heuristics": r["heuristics"],
         })
 
+    # ── Build IP detail rows ──────────────────────────────────
+    ip_details = []
+    for r in ip_results:
+        ip_details.append({
+            "ip":            r["ip"],
+            "source":        r["source"],
+            "context":       r["context"],
+            "risk":          r["risk"],
+            "abuse_score":   r.get("abuse_score", 0),
+            "reports":       r.get("reports", 0),
+            "last_reported": r.get("last_reported"),
+            "country":       r.get("country"),
+            "isp":           r.get("isp"),
+            "flags":         r.get("flags", []),
+        })
+
     # ── Collect all red flags ─────────────────────────────────
     all_flags = list(flags)  # from feature extractor
     for r in url_results:
         for h in r.get("heuristics", []):
             entry = f"[{r['domain']}] {h}"
+            if entry not in all_flags:
+                all_flags.append(entry)
+    for r in ip_results:
+        for f in r.get("flags", []):
+            entry = f"[IP: {r['ip']}] {f}"
             if entry not in all_flags:
                 all_flags.append(entry)
 
@@ -145,6 +182,11 @@ def build_report(
         "url_count":   len(url_list),
         "url_details": url_details,
         "url_summary": url_summary,
+
+        # IP addresses
+        "ip_count":    len(ip_results),
+        "ip_details":  ip_details,
+        "ip_summary":  ip_summary,
 
         # Attachment info
         "attachments": parsed.get("attachments", []),
@@ -183,3 +225,43 @@ def _build_recommendation(score: int, flags: list, features: dict) -> str:
         lines.append("Dangerous attachment detected — do not open it.")
 
     return " ".join(lines)
+
+
+def summarize_ip_risks(ip_results: list[dict]) -> dict:
+    """
+    Summarize IP threat results into a single risk assessment.
+    Returns {"max_risk": str, "high_count": int, "medium_count": int, "low_count": int, "flagged_ips": list}
+    """
+    risk_order = {"high": 4, "medium": 3, "low": 2, "clean": 1, "unknown": 0}
+    max_risk   = "clean"
+    high_count = medium_count = low_count = 0
+    flagged    = []
+
+    for r in ip_results:
+        risk = r.get("risk", "unknown")
+        if risk_order.get(risk, 0) > risk_order.get(max_risk, 0):
+            max_risk = risk
+        if risk == "high":
+            high_count += 1
+            flagged.append({
+                "ip": r["ip"],
+                "abuse_score": r.get("abuse_score", 0),
+                "reports": r.get("reports", 0)
+            })
+        elif risk == "medium":
+            medium_count += 1
+            flagged.append({
+                "ip": r["ip"],
+                "abuse_score": r.get("abuse_score", 0),
+                "reports": r.get("reports", 0)
+            })
+        elif risk == "low":
+            low_count += 1
+
+    return {
+        "max_risk":     max_risk,
+        "high_count":   high_count,
+        "medium_count": medium_count,
+        "low_count":    low_count,
+        "flagged_ips":  flagged,
+    }

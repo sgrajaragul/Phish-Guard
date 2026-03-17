@@ -8,7 +8,7 @@ from flask import Flask, request, jsonify, render_template
 
 from app.parser import parse_email
 from app.features import extract_features
-from app.threat_intel import check_urls
+from app.threat_intel import check_urls, check_ips
 from app.report import build_report
 from app.model import predict, model_exists
 
@@ -57,6 +57,7 @@ def analyze():
         parsed      = parse_email(raw_email)
         feat_result = extract_features(parsed)
         url_results = check_urls(feat_result.get("url_list", []))
+        ip_results  = check_ips(parsed.get("ip_addresses", []))
 
         if model_exists():
             ml_result = predict(parsed)
@@ -71,7 +72,7 @@ def analyze():
                 "probability": {"Phishing": phish_prob, "Legitimate": 1 - phish_prob},
             }
 
-        report = build_report(parsed, feat_result, ml_result, url_results)
+        report = build_report(parsed, feat_result, ml_result, url_results, ip_results)
         return jsonify(report)
 
     except Exception as e:

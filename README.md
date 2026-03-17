@@ -16,6 +16,7 @@ A full-stack machine learning tool that analyzes emails for phishing indicators 
 - **ML Classifier** — Random Forest + TF-IDF trained on SpamAssassin/Enron corpus
 - **40+ Engineered Features** — header anomalies, urgency language, credential lures, HTML structure
 - **URL Threat Intelligence** — heuristic scoring + optional VirusTotal API integration
+- **IP Threat Intelligence** — AbuseIPDB integration to check sender IPs for previous attacks
 - **Risk Scoring Engine** — weighted combination of ML output + feature signals (0–100 score)
 - **Web Dashboard** — clean Flask UI, supports paste or `.eml` file upload
 - **Zero-key Mode** — fully functional without any API keys (heuristic-only fallback)
@@ -129,16 +130,32 @@ Response:
   "flags": [
     "Reply-To domain differs from sender",
     "Subject uses urgency language",
-    "1 URL(s) use raw IP addresses"
+    "1 URL(s) use raw IP addresses",
+    "[IP: 185.220.101.5] High abuse score: 85% confidence",
+    "[IP: 185.220.101.5] Reported 47 times for abuse"
   ],
   "url_details": [...],
+  "ip_count": 2,
+  "ip_details": [
+    {
+      "ip": "185.220.101.5",
+      "source": "Received header",
+      "risk": "high",
+      "abuse_score": 85,
+      "reports": 47,
+      "country": "NL",
+      "isp": "Evil Hosting Ltd"
+    }
+  ],
   "recommendation": "..."
 }
 ```
 
 ---
 
-## Optional: VirusTotal Integration
+## Optional: Threat Intelligence APIs
+
+### VirusTotal (URL scanning)
 
 Set your free VirusTotal API key (500 requests/day) for live URL scanning:
 
@@ -148,6 +165,25 @@ python app.py
 ```
 
 Get a free key at [virustotal.com](https://www.virustotal.com/gui/join-us).
+
+### AbuseIPDB (IP reputation)
+
+Set your free AbuseIPDB API key (1000 requests/day) for IP abuse history checking:
+
+```bash
+export ABUSEIPDB_API_KEY=your_key_here
+python app.py
+```
+
+Get a free key at [abuseipdb.com](https://www.abuseipdb.com/register).
+
+**What it detects:**
+- IPs previously reported for phishing attacks
+- IPs with history of sending spam
+- IPs associated with malware distribution
+- Abuse confidence score (0-100%)
+- Number of reports and last reported date
+- Country and ISP information
 
 ---
 
