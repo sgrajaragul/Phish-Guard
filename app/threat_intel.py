@@ -6,8 +6,9 @@ Uses free, no-key-required sources first:
   2. PhishTank free lookup
   3. Heuristic scoring (fallback — always available)
 
-Optional (set env vars to enable):
+Optional (configure in api_keys.py):
   VIRUSTOTAL_API_KEY — VirusTotal v3 free tier (500 req/day)
+  ABUSEIPDB_API_KEY — AbuseIPDB free tier (1000 req/day)
 """
 
 import os
@@ -16,6 +17,21 @@ import time
 import hashlib
 import urllib.parse
 import requests
+
+# Import API keys from centralized configuration
+try:
+    import api_keys
+except ImportError:
+    # Fallback: create a dummy api_keys module if file doesn't exist
+    class api_keys:
+        @staticmethod
+        def get_api_key(service_name):
+            # Try environment variables as fallback
+            if service_name.lower() == 'virustotal':
+                return os.getenv('VIRUSTOTAL_API_KEY')
+            elif service_name.lower() == 'abuseipdb':
+                return os.getenv('ABUSEIPDB_API_KEY')
+            return None
 
 OPENPHISH_URL  = "https://openphish.com/feed.txt"
 PHISHTANK_API  = "https://checkurl.phishtank.com/checkurl/"
@@ -57,7 +73,7 @@ def check_ips(ip_data: list[dict]) -> list[dict]:
         list of dicts with IP reputation data
     """
     results = []
-    abuseipdb_key = os.getenv("ABUSEIPDB_API_KEY")
+    abuseipdb_key = api_keys.get_api_key("abuseipdb")
     
     for ip_info in ip_data[:10]:  # cap at 10 to avoid rate limits
         ip = ip_info["ip"]
@@ -178,7 +194,7 @@ def _check_single(url: str) -> dict:
     result["heuristics"] = h_flags
 
     # ── VirusTotal (optional, requires API key) ───────────────
-    vt_key = os.getenv("VIRUSTOTAL_API_KEY")
+    vt_key = api_keys.get_api_key("virustotal")
     if vt_key:
         vt_result = _virustotal_check(url, vt_key)
         if vt_result:
