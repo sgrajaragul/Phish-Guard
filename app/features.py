@@ -2,6 +2,7 @@
 features.py — Extracts ML-ready and human-readable features from a parsed email.
 
 Categories:
+  - Email authentication (SPF, DMARC, DKIM)  ⭐ NEW
   - Header anomalies   (sender mismatch, reply-to divergence)
   - Urgency language   (NLP keyword scoring)
   - URL signals        (IP-based, excessive redirects, mismatched text)
@@ -81,8 +82,31 @@ def extract_features(parsed: dict) -> dict:
     body_html = parsed.get("body_html", "")
     urls      = parsed.get("urls", [])
     attachments = parsed.get("attachments", [])
+    raw_email = parsed.get("raw", "")
 
     body_lower = body.lower()
+
+    # ── 0. Email Authentication (SPF/DMARC/DKIM) ⭐ NEW ───────
+    auth_results = _check_email_authentication(raw_email)
+    
+    features["spf_pass"] = int(auth_results["spf"] == "pass")
+    features["dkim_pass"] = int(auth_results["dkim"] == "pass")
+    features["dmarc_pass"] = int(auth_results["dmarc"] == "pass")
+    features["auth_fail_count"] = auth_results["fail_count"]
+    
+    # Critical flags for authentication failures
+    if auth_results["spf"] == "fail":
+        flags.append("⚠️ SPF authentication FAILED - sender not authorized")
+    if auth_results["dkim"] == "fail":
+        flags.append("⚠️ DKIM signature FAILED - message may be forged")
+    if auth_results["dmarc"] == "fail":
+        flags.append("⚠️ DMARC check FAILED - domain policy violation")
+    
+    # Soft fails are suspicious but not definitive
+    if auth_results["spf"] == "softfail":
+        flags.append("SPF soft-fail - sender authorization uncertain")
+    if auth_results["dmarc"] == "none" and _is_known_domain(sender):
+        flags.append("No DMARC policy found - unusual for major brands")
 
     # ── 1. Header anomalies ───────────────────────────────────
     sender_domain   = _extract_domain(sender)
@@ -195,6 +219,91 @@ def features_to_vector(features: dict) -> list:
     """
     keys = sorted(features.keys())
     return [float(features[k]) for k in keys], keys
+
+
+# ── Email Authentication Helpers ──────────────────────────────────────────────
+
+def _check_email_authentication(raw_email: str) -> dict:
+    """
+    Check SPF, DKIM, and DMARC authentication results from email headers.
+    
+    Returns:
+        {
+            "spf": "pass" | "fail" | "softfail" | "neutral" | "none",
+            "dkim": "pass" | "fail" | "none",
+            "dmarc": "pass" | "fail" | "none",
+            "fail_count": int (number of failed checks)
+        }
+    """
+    result = {
+        "spf": "none",
+        "dkim": "none",
+        "dmarc": "none",
+        "fail_count": 0
+    }
+    
+    raw_lower = raw_email.lower()
+    
+    # ── Check Authentication-Results header ───────────────────
+    # Format: Authentication-Results: mx.google.com;
+    #         spf=pass smtp.mailfrom=example.com;
+    #         dkim=pass header.i=@example.com;
+    #         dmarc=pass header.from=example.com;
+    
+    auth_header_match = re.search(
+        r'authentication-results:.*?(?=\n(?:[a-z-]+:|$))',
+        raw_lower,
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    if auth_header_match:
+        auth_header = auth_header_match.group(0)
+        
+        # SPF check
+        spf_match = re.search(r'spf=(pass|fail|softfail|neutral|none)', auth_header)
+        if spf_match:
+            result["spf"] = spf_match.group(1)
+        
+        # DKIM check
+        dkim_match = re.search(r'dkim=(pass|fail|none)', auth_header)
+        if dkim_match:
+            result["dkim"] = dkim_match.group(1)
+        
+        # DMARC check
+        dmarc_match = re.search(r'dmarc=(pass|fail|none)', auth_header)
+        if dmarc_match:
+            result["dmarc"] = dmarc_match.group(1)
+    
+    # ── Also check Received-SPF header ────────────────────────
+    if result["spf"] == "none":
+        spf_header_match = re.search(
+            r'received-spf:\s*(pass|fail|softfail|neutral|none)',
+            raw_lower
+        )
+        if spf_header_match:
+            result["spf"] = spf_header_match.group(1)
+    
+    # ── Count failures ─────────────────────────────────────────
+    if result["spf"] in ["fail", "softfail"]:
+        result["fail_count"] += 1
+    if result["dkim"] == "fail":
+        result["fail_count"] += 1
+    if result["dmarc"] == "fail":
+        result["fail_count"] += 1
+    
+    return result
+
+
+def _is_known_domain(email: str) -> bool:
+    """Check if sender is from a known major brand that should have DMARC."""
+    domain = _extract_domain(email)
+    major_brands = {
+        "paypal.com", "amazon.com", "microsoft.com", "apple.com",
+        "google.com", "facebook.com", "netflix.com", "linkedin.com",
+        "twitter.com", "instagram.com", "yahoo.com", "bankofamerica.com",
+        "wellsfargo.com", "chase.com", "citibank.com", "irs.gov",
+    }
+    return domain in major_brands
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────

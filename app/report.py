@@ -1,38 +1,55 @@
 """
 report.py — Builds the final analysis report combining ML prediction,
-            feature flags, and URL threat intelligence.
+            feature flags, and threat intelligence.
+
+UPDATED: Better risk scoring to reduce false positives
 """
 
 from app.threat_intel import summarize_url_risks
 
 
 RISK_WEIGHTS = {
-    # ML model is the primary signal — max 55 pts
-    "ml_phishing_confidence": 55,
-
-    # URL threat intelligence — strong independent signal
-    "url_high_risk":   20,
-    "url_medium_risk":  8,
-
-    # IP threat intelligence — independent signal
+    # ══════════════════════════════════════════════════════════════════════════
+    # PRIMARY SIGNALS (High confidence, independent verification)
+    # ══════════════════════════════════════════════════════════════════════════
+    
+    # Email Authentication FAILURES (⭐ NEW - Most reliable signal)
+    "spf_fail":        35,   # SPF fail is very strong signal
+    "dkim_fail":       35,   # DKIM fail means forged/tampered
+    "dmarc_fail":      30,   # DMARC fail indicates policy violation
+    
+    # ML model (still primary but now balanced with auth)
+    "ml_phishing_confidence": 45,  # Reduced from 55 to balance with auth
+    
+    # IP threat intelligence (independent verification)
     "ip_high_risk":    25,
     "ip_medium_risk":  12,
     "ip_low_risk":      5,
-
-    # Feature bonuses — only meaningful alongside ML suspicion
-    # These are multiplied by ml_phishing_prob so they don't inflate legit scores
-    "has_script":           18,
-    "has_form":             12,
-    "sender_mismatch":      12,
-    "dangerous_attachment": 18,
-    "credential_lure":       8,
-    "ip_url":               14,
-    "hidden_text":           8,
-    "url_at_sign":          10,
+    
+    # URL threat intelligence (independent verification)
+    "url_high_risk":   20,
+    "url_medium_risk":  8,
+    
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECONDARY SIGNALS (Context-dependent, require ML confidence)
+    # ══════════════════════════════════════════════════════════════════════════
+    
+    # Feature bonuses — only apply when ML is already suspicious
+    # These are multiplied by ml_phishing_prob to prevent false positives
+    "has_script":           15,  # Reduced from 18
+    "has_form":             10,  # Reduced from 12
+    "sender_mismatch":       8,  # Reduced from 12
+    "dangerous_attachment": 15,  # Reduced from 18
+    "credential_lure":       6,  # Reduced from 8
+    "ip_url":               10,  # Reduced from 14
+    "hidden_text":           6,  # Reduced from 8
+    "url_at_sign":           8,  # Reduced from 10
 }
 
-# Below this ML threshold, feature bonuses are heavily dampened
-ML_BONUS_THRESHOLD = 0.45
+# Thresholds for applying feature bonuses
+ML_BONUS_THRESHOLD = 0.50  # Increased from 0.45 to be more conservative
+BONUS_MULTIPLIER_LOW = 0.2  # When ML < threshold, bonuses are minimal
+BONUS_MULTIPLIER_HIGH = 1.0  # When ML >= threshold, full bonuses apply
 
 
 def build_report(
@@ -43,7 +60,7 @@ def build_report(
     ip_results:  list[dict] = None,
 ) -> dict:
     """
-    Build a comprehensive phishing analysis report.
+    Build a comprehensive phishing analysis report with reduced false positives.
 
     Args:
         parsed:      Output from parser.parse_email()
@@ -66,50 +83,102 @@ def build_report(
 
     # ── Risk score calculation (0–100) ────────────────────────
     score = 0
-
-    # ML contribution — primary signal (up to 55 pts)
+    
+    # ══════════════════════════════════════════════════════════
+    # PRIMARY SIGNALS (Always apply full weight)
+    # ══════════════════════════════════════════════════════════
+    
+    # Email Authentication Failures (⭐ NEW - Highest priority)
+    # These are INDEPENDENT signals - don't need ML confirmation
+    if not features.get("spf_pass", 0):
+        # Check if it's a hard fail or just missing
+        if features.get("auth_fail_count", 0) > 0:
+            score += RISK_WEIGHTS["spf_fail"]
+    
+    if not features.get("dkim_pass", 0):
+        if features.get("auth_fail_count", 0) > 0:
+            score += RISK_WEIGHTS["dkim_fail"]
+    
+    if not features.get("dmarc_pass", 0):
+        if features.get("auth_fail_count", 0) > 0:
+            score += RISK_WEIGHTS["dmarc_fail"]
+    
+    # ML contribution
     phish_prob = ml_result["probability"].get("Phishing", 0.0)
     score += int(phish_prob * RISK_WEIGHTS["ml_phishing_confidence"])
-
-    # URL threat intel — independent of ML, always full weight
-    score += url_summary["high_count"]   * RISK_WEIGHTS["url_high_risk"]
-    score += url_summary["medium_count"] * RISK_WEIGHTS["url_medium_risk"]
-
-    # IP threat intel — independent of ML, always full weight
+    
+    # IP threat intel (independent signal - always full weight)
     score += ip_summary["high_count"]   * RISK_WEIGHTS["ip_high_risk"]
     score += ip_summary["medium_count"] * RISK_WEIGHTS["ip_medium_risk"]
     score += ip_summary["low_count"]    * RISK_WEIGHTS["ip_low_risk"]
-
-    # Feature flag bonuses — scaled by ML confidence
-    # When ML says <45% phishing, bonuses are heavily dampened (×0.3)
-    # When ML says >45% phishing, bonuses apply at full weight
-    # This prevents legit emails from scoring high just from keyword matches
-    bonus_multiplier = 1.0 if phish_prob >= ML_BONUS_THRESHOLD else 0.3
-
+    
+    # URL threat intel (independent signal - always full weight)
+    score += url_summary["high_count"]   * RISK_WEIGHTS["url_high_risk"]
+    score += url_summary["medium_count"] * RISK_WEIGHTS["url_medium_risk"]
+    
+    # ══════════════════════════════════════════════════════════
+    # SECONDARY SIGNALS (Context-dependent bonuses)
+    # ══════════════════════════════════════════════════════════
+    
+    # Feature bonuses are scaled by ML confidence to prevent false positives
+    # Logic: If ML says probably legit (<50%), these signals carry minimal weight
+    #        If ML says probably phishing (>=50%), these signals reinforce verdict
+    
+    if phish_prob >= ML_BONUS_THRESHOLD:
+        bonus_multiplier = BONUS_MULTIPLIER_HIGH
+    else:
+        bonus_multiplier = BONUS_MULTIPLIER_LOW
+    
+    # Apply bonuses
     if features.get("script_count", 0) > 0:
         score += int(RISK_WEIGHTS["has_script"] * bonus_multiplier)
+    
     if features.get("form_count", 0) > 0:
         score += int(RISK_WEIGHTS["has_form"] * bonus_multiplier)
+    
     if features.get("sender_replyto_mismatch") or features.get("sender_retpath_mismatch"):
         score += int(RISK_WEIGHTS["sender_mismatch"] * bonus_multiplier)
+    
     if features.get("dangerous_attachment", 0) > 0:
         score += int(RISK_WEIGHTS["dangerous_attachment"] * bonus_multiplier)
+    
     if features.get("body_credential_score", 0) >= 1:
         score += int(RISK_WEIGHTS["credential_lure"] * bonus_multiplier)
+    
     if features.get("urls_with_ip", 0) > 0:
         score += int(RISK_WEIGHTS["ip_url"] * bonus_multiplier)
+    
     if features.get("hidden_text", 0) > 0:
         score += int(RISK_WEIGHTS["hidden_text"] * bonus_multiplier)
+    
     if features.get("urls_with_at_sign", 0) > 0:
         score += int(RISK_WEIGHTS["url_at_sign"] * bonus_multiplier)
-
+    
+    # ══════════════════════════════════════════════════════════
+    # LEGITIMATE EMAIL ADJUSTMENTS (Reduce false positives)
+    # ══════════════════════════════════════════════════════════
+    
+    # If ALL authentication checks pass, significantly reduce score
+    if (features.get("spf_pass", 0) and 
+        features.get("dkim_pass", 0) and 
+        features.get("dmarc_pass", 0)):
+        # All auth passed - very strong legitimate signal
+        score = int(score * 0.6)  # Reduce by 40%
+        flags.append("✓ All email authentication checks passed (SPF, DKIM, DMARC)")
+    
+    # If at least SPF+DKIM pass (common for legit emails without DMARC)
+    elif (features.get("spf_pass", 0) and features.get("dkim_pass", 0)):
+        score = int(score * 0.75)  # Reduce by 25%
+        flags.append("✓ Email authentication passed (SPF + DKIM)")
+    
     score = min(score, 100)   # cap at 100
 
     # ── Verdict ───────────────────────────────────────────────
-    if score >= 70:
+    # More conservative thresholds to reduce false positives
+    if score >= 75:  # Increased from 70
         verdict = "Phishing"
         verdict_color = "danger"
-    elif score >= 40:
+    elif score >= 50:  # Increased from 40
         verdict = "Suspicious"
         verdict_color = "warning"
     else:
@@ -177,6 +246,11 @@ def build_report(
         "subject":    parsed.get("subject", "—"),
         "date":       parsed.get("date", "—"),
 
+        # Email Authentication (⭐ NEW)
+        "spf_status":   "Pass" if features.get("spf_pass", 0) else "Fail",
+        "dkim_status":  "Pass" if features.get("dkim_pass", 0) else "Fail",
+        "dmarc_status": "Pass" if features.get("dmarc_pass", 0) else "Fail",
+
         # Flags and URLs
         "flags":       all_flags,
         "url_count":   len(url_list),
@@ -200,14 +274,14 @@ def build_report(
 
 
 def _build_recommendation(score: int, flags: list, features: dict) -> str:
-    if score >= 70:
+    if score >= 75:
         lines = [
             "⚠️ This email shows strong indicators of a phishing attack.",
             "Do NOT click any links or download attachments.",
             "Do NOT enter credentials if you followed a link from this email.",
             "Report this email to your IT/security team and delete it.",
         ]
-    elif score >= 40:
+    elif score >= 50:
         lines = [
             "⚠️ This email has several suspicious characteristics.",
             "Treat with caution — verify the sender through a separate channel before acting.",
@@ -216,8 +290,11 @@ def _build_recommendation(score: int, flags: list, features: dict) -> str:
     else:
         lines = [
             "✅ This email appears to be legitimate based on available signals.",
-            "Always exercise caution — no automated tool is 100% accurate.",
         ]
+        # Add authentication confidence if all checks passed
+        if features.get("spf_pass", 0) and features.get("dkim_pass", 0):
+            lines.append("Email authentication (SPF/DKIM) passed successfully.")
+        lines.append("Always exercise caution — no automated tool is 100% accurate.")
 
     if features.get("script_count", 0) > 0:
         lines.append("JavaScript was found in this email — this is almost never legitimate.")
@@ -230,7 +307,6 @@ def _build_recommendation(score: int, flags: list, features: dict) -> str:
 def summarize_ip_risks(ip_results: list[dict]) -> dict:
     """
     Summarize IP threat results into a single risk assessment.
-    Returns {"max_risk": str, "high_count": int, "medium_count": int, "low_count": int, "flagged_ips": list}
     """
     risk_order = {"high": 4, "medium": 3, "low": 2, "clean": 1, "unknown": 0}
     max_risk   = "clean"
